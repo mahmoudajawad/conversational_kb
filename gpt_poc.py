@@ -1,6 +1,7 @@
 import glob
 import json
 import logging
+import math
 import os
 import pathlib
 import sys
@@ -8,6 +9,8 @@ import sys
 import openai
 from dotenv import load_dotenv
 from openai.embeddings_utils import cosine_similarity
+
+from _shared import SYSTEM_PROMPT, num_tokens_from_messages
 
 load_dotenv()
 
@@ -17,6 +20,8 @@ ARTICLES: dict[str, str] = {}
 EMBEDDINGS: dict[str, list[float]] = {}
 MESSAGES: list[dict[str, str]] = []
 ARTICLES_MATCH: list[str] = []
+
+MAX_KNOWLEDGE = 5
 
 
 def main() -> None:
@@ -47,27 +52,66 @@ def ama_loop() -> None:
         match_article = embeddings_scores_sorted[0][0]
         ARTICLES_MATCH.append(match_article)
 
+        logging.debug("Embeddings scores: %s", embeddings_scores_sorted)
+        logging.debug("Resorting to find answer from: %s", match_article)
+
+        # Build knowledge:
+        # Use top most matched article
+        knowledge_count = 1
         knowledge = ARTICLES[match_article]
         if ARTICLES_MATCH:
             last_match_article = ARTICLES_MATCH[-1]
             if last_match_article != match_article:
-                knowledge += f"\n{ARTICLES_MATCH[last_match_article]}"
+                knowledge += f"\n{last_match_article}"
+        # Loop over all articles scores to add up to MAX_KNOWLEDGE articles with match score > 0.85
+        for article, score in embeddings_scores_sorted[1:]:
+            if score >= 0.80:
+                knowledge += f"\n{ARTICLES[article]}"
+                knowledge_count += 1
+            if knowledge_count > MAX_KNOWLEDGE:
+                break
 
-        logging.debug("Embeddings scores: %s", embeddings_scores_sorted)
-        logging.debug("Resorting to find answer from: %s", match_article)
+        logging.debug("Compiled knowledge of %s articles", knowledge_count)
 
         MESSAGES.append({"role": "user", "content": question})
 
+        system_prompt = f"{SYSTEM_PROMPT}{knowledge}"
         messages = [
             {
                 "role": "system",
-                "content": f"You are a chat bot who is supposed to help users with tourism related questions. You should politely decline answering any question not related to tourism. You should always answer in the same language as the question is. Your only source of knowledge is following text: {knowledge}",
+                "content": system_prompt,
             },
-            *MESSAGES[-10:],
         ]
+
+        # Truncate system message to reach optimal 2500 tokens
+        # TODO: Change into recursion
+        knowledge_tokens_count = num_tokens_from_messages(messages)
+        while True:
+            if knowledge_tokens_count <= 2500:
+                break
+            # While tokens count, usually, more than words, truncate only number of excess words
+            knowledge_words = messages[0]["content"].split(" ")
+            knowledge_words_count = len(knowledge_words)
+            messages[0]["content"] = " ".join(
+                knowledge_words[
+                    : math.floor(
+                        (knowledge_words_count * 2500) / knowledge_tokens_count
+                    )
+                ]
+            )
+            knowledge_tokens_count = num_tokens_from_messages(messages)
+
+        for message in MESSAGES[:-10:-1]:
+            if num_tokens_from_messages([*messages, message]) < 3500:
+                messages.append(message)
+
+        logging.debug("Messages to be sent to OpenAI: %s", messages)
+        logging.debug("Total messages count is: %s", len(messages))
+
         answer = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             messages=messages,
+            max_tokens=1000,
         )
         response_text = answer["choices"][0]["message"]["content"]
         MESSAGES.append({"role": "assistant", "content": response_text})
@@ -83,11 +127,10 @@ def generate_articles_embeddings() -> None:
     logging.info("Attempting to check articles...")
     dirname = os.path.dirname(__file__)
     articles = glob.glob(os.path.join(dirname, "articles", "*.txt"))
-    embeddings = glob.glob(os.path.join(os.path.join(dirname, "embeddings", "*.json")))
 
     for article in articles:
-        article_name = pathlib.Path(article).name
-        if os.path.isfile(f"embeddings/{article_name[:-4]}.json"):
+        article_name = pathlib.Path(article).stem
+        if os.path.isfile(f"embeddings/{article_name}.json"):
             logging.info(
                 "Article '%s' embeddings already generated. Skipping..", article_name
             )
@@ -95,7 +138,7 @@ def generate_articles_embeddings() -> None:
             with open(article, encoding="UTF-8") as f:
                 ARTICLES[article_name] = f.read()
 
-            with open(f"embeddings/{article_name[:-4]}.json", encoding="UTF-8") as f:
+            with open(f"embeddings/{article_name}.json", encoding="UTF-8") as f:
                 EMBEDDINGS[article_name] = json.loads(f.read())
 
             continue
@@ -109,7 +152,7 @@ def generate_articles_embeddings() -> None:
             article_embeddings = get_embedding(article_content)
             EMBEDDINGS[article_name] = article_embeddings
 
-        with open(f"embeddings/{article_name[:-4]}.json", "w", encoding="UTF-8") as f:
+        with open(f"embeddings/{article_name}.json", "w", encoding="UTF-8") as f:
             f.write(json.dumps(article_embeddings))
 
         logging.info("  - Done")
