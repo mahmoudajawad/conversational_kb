@@ -59,10 +59,10 @@ def ama_loop() -> None:
         # Use top most matched article
         knowledge_count = 1
         knowledge = ARTICLES[match_article]
-        if ARTICLES_MATCH:
-            last_match_article = ARTICLES_MATCH[-1]
-            if last_match_article != match_article:
-                knowledge += f"\n{last_match_article}"
+        # Also add last matched article to give GPT the chance to understand follow-up questions
+        last_match_article = ARTICLES_MATCH[-1]
+        if last_match_article != match_article:
+            knowledge += f"\n{last_match_article}"
         # Loop over all articles scores to add up to MAX_KNOWLEDGE articles with match score > 0.85
         for article, score in embeddings_scores_sorted[1:]:
             if score >= 0.80:
@@ -101,9 +101,14 @@ def ama_loop() -> None:
             )
             knowledge_tokens_count = num_tokens_from_messages(messages)
 
-        for message in MESSAGES[:-10:-1]:
+        # Insert user question
+        messages.append(MESSAGES[-1])
+
+        # Loop in reverse over all messages (except last which is already added) and add as many as possible
+        # without breaking token limit of 3500
+        for i, message in enumerate(MESSAGES[1:-10:-1]):
             if num_tokens_from_messages([*messages, message]) < 3500:
-                messages.append(message)
+                messages.insert(len(messages) - (i + 1), message)
 
         logging.debug("Messages to be sent to OpenAI: %s", messages)
         logging.debug("Total messages count is: %s", len(messages))
